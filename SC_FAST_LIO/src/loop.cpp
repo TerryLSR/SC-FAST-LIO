@@ -63,19 +63,19 @@ private:
     // ros::Subscriber odom_sub_;
     // ros::Subscriber key_frame_cloud_sub_;
 
-    ros::Publisher key_frame_pose_pub_;
+    ros::Publisher key_frame_pose_pub_, gt_pose_pub_;
     ros::Publisher pubLoopConstraintEdge_;
     ros::Publisher pubIcpKeyFrames_;
     ros::Publisher pubGlobalMap_;
 
-    std::string front_laser_odom_topic_ = "/Odometry";
-    std::string cloud_topic_ = "/cloud_registered_body";
+    std::string front_laser_odom_topic_ = "/Odometry"; //Odometry ndt_lio_odom
+    std::string cloud_topic_ = "/cloud_registered_body"; //cloud_registered_body pandar
     bool first_frame_ = true;
 
     std::deque<CloudPoseXYZOri> key_frame_odom_poses_, corrected_frame_pose_;
 
     typedef pcl::PointXYZI  PointType;
-    pcl::PointCloud<PointType>::Ptr path_cloud_;
+    pcl::PointCloud<PointType>::Ptr path_cloud_, gt_path_;
     pcl::PointCloud<PointType>::Ptr corrected_path_cloud_;
 
     std::vector<std::pair<int, int>> loopIndexQueue;
@@ -97,6 +97,19 @@ private:
         pcl::PointCloud<PointType>::Ptr pc_ptr;
         double pc_time;
     }LidarData;
+
+    typedef struct
+    {
+        double time;
+        double x;
+        double y;
+        double z;
+        double ori_x;
+        double ori_y;
+        double ori_z;
+        double ori_w;
+    }GTPose;
+    
     
     std::deque<LidarData> lidar_buffer_ ,all_lidar_buffer_;
     std::mutex data_lock_;
@@ -110,7 +123,7 @@ private:
 
     // loop detector 
     SCManager scManager_;
-    int historyKeyframeSearchNum_ = 25;
+    int historyKeyframeSearchNum_ = 15;
     pcl::PointCloud<PointType>::Ptr SClatestSurfKeyFrameCloud_;
     pcl::PointCloud<PointType>::Ptr SCnearHistorySurfKeyFrameCloud_;
     pcl::PointCloud<PointType>::Ptr SCnearHistorySurfKeyFrameCloudDS_;
@@ -120,7 +133,7 @@ private:
 
     pcl::PointCloud<PointType>::Ptr globalMapKeyFramesDS_;
 
-    double historyKeyframeFitnessScore_ = 0.16;
+    double historyKeyframeFitnessScore_ = 1.0; // 0.16
     int SCclosestHistoryFrameID_;
 
     unsigned short loop_frame_skip_cnt_ = 0;
@@ -133,11 +146,15 @@ private:
     gtsam::noiseModel::Diagonal::shared_ptr priorNoise;
     gtsam::noiseModel::Diagonal::shared_ptr odometryNoise;
 
+    std::string map_frame_id_ = "camera_init"; //camera_init
+
 public:
     LoopClosure(/* args */){
         // key_frame_cloud_sub_ = nh.subscribe<sensor_msgs::PointCloud2>("/cloud_registered_body", 2, &LoopClosure::cloud_callbac   k, this);
         // odom_sub_ = nh_.subscribe(front_laser_odom_topic_, 200000, &LoopClosure::odom_callback, this);
         key_frame_pose_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/keyframe_pose", 100000, true);
+
+        gt_pose_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/gt_pose", 100000, true);
         pubIcpKeyFrames_ = nh_.advertise<sensor_msgs::PointCloud2>("/corrected_cloud", 2, true);
         pubGlobalMap_ = nh_.advertise<sensor_msgs::PointCloud2>("/global_map_cloud", 2, true);
 
@@ -147,7 +164,7 @@ public:
         sync_->registerCallback(boost::bind(&LoopClosure::SyncDataCallback, this, _1, _2));
 
         pubLoopConstraintEdge_ = nh_.advertise<visualization_msgs::MarkerArray>("/loop_closure_constraints", 1, true);
-        
+        gt_path_.reset(new pcl::PointCloud<PointType>());
         path_cloud_.reset(new pcl::PointCloud<PointType>());
         corrected_path_cloud_.reset(new pcl::PointCloud<PointType>());
 
@@ -269,7 +286,7 @@ public:
         sensor_msgs::PointCloud2 PoseCloudMap;
         pcl::toROSMsg(*path_in, PoseCloudMap);
         PoseCloudMap.header.stamp = ros::Time().fromSec(time);
-        PoseCloudMap.header.frame_id = "camera_init";
+        PoseCloudMap.header.frame_id = map_frame_id_;
         key_frame_pose_pub_.publish(PoseCloudMap);
     }
 
@@ -278,7 +295,7 @@ public:
         visualization_msgs::MarkerArray markerArray;
         // loop nodes
         visualization_msgs::Marker markerNode;
-        markerNode.header.frame_id = "camera_init";
+        markerNode.header.frame_id = map_frame_id_;
         markerNode.header.stamp = ros::Time::now();
         markerNode.action = visualization_msgs::Marker::ADD;
         markerNode.type = visualization_msgs::Marker::SPHERE_LIST;
@@ -290,7 +307,7 @@ public:
         markerNode.color.a = 1;
         // loop edges
         visualization_msgs::Marker markerEdge;
-        markerEdge.header.frame_id = "camera_init";
+        markerEdge.header.frame_id = map_frame_id_;
         markerEdge.header.stamp = ros::Time::now();
         markerEdge.action = visualization_msgs::Marker::ADD;
         markerEdge.type = visualization_msgs::Marker::LINE_LIST;
@@ -325,10 +342,66 @@ public:
 
     void visualizeGlobalMapThread(){
         ros::Rate rate(0.2);
+        // ReadGT();
         while (ros::ok()){
             rate.sleep();
-            // publishGlobalMap();
+            publishGlobalMap();
         }       
+    }
+
+    void ReadGT()
+    {
+        std::string filepath = "/home/hh/桌面/Fserial/street_08.txt";
+        FILE *infile;
+        infile = fopen(filepath.c_str(),"r");
+        
+        GTPose p;
+        PointType pc_init, pc_p;
+        bool first = true;
+        unsigned short skip_cnt = 0;
+        Eigen::Quaterniond q_init;
+        Eigen::Matrix3d m_init;
+        Eigen::Vector3d tmp_p;
+        while (1)
+        {
+            int flag = std::fscanf(infile,"%lf %lf %lf %lf %lf %lf %lf %lf",&p.time ,&p.x,&p.y,&p.z,&p.ori_x,&p.ori_y,&p.ori_z, &p.ori_w);
+            if(flag != 8) break;
+            if(p.time < 1628249306.10)
+                continue;
+            if(skip_cnt%20 == 0)
+            {
+                if(first)
+                {
+                    first = false;
+                    pc_init.x = p.x;
+                    pc_init.y = p.y;
+                    pc_init.z = p.z;
+                    q_init.x() = 0;
+                    q_init.y() = 0;
+                    q_init.z() = -0.866;
+                    q_init.w() = 0.5;
+                    m_init = q_init.matrix();
+                }
+                pc_p.x = p.x - pc_init.x;
+                pc_p.y = p.y - pc_init.y;
+                pc_p.z = p.z - pc_init.z;
+                tmp_p << pc_p.x, pc_p.y, pc_p.z;
+                tmp_p = m_init.inverse() * tmp_p;
+                pc_p.x = tmp_p(0);
+                pc_p.y = tmp_p(1);
+                pc_p.z = tmp_p(2);
+                
+                pc_p.intensity = pc_p.z;
+                gt_path_->push_back(pc_p);
+            }   
+        }
+        fclose(infile);
+        sensor_msgs::PointCloud2 cloudMsgTemp;
+        pcl::toROSMsg(*gt_path_, cloudMsgTemp);
+        cloudMsgTemp.header.stamp = ros::Time::now(); // use sim time
+        cloudMsgTemp.header.frame_id = map_frame_id_;
+        gt_pose_pub_.publish(cloudMsgTemp);  
+        
     }
 
     //TODO: publishGlobalMap another thread 
@@ -352,7 +425,7 @@ public:
         sensor_msgs::PointCloud2 cloudMsgTemp;
         pcl::toROSMsg(*globalMapKeyFramesDS_, cloudMsgTemp);
         cloudMsgTemp.header.stamp = ros::Time::now(); // use sim time
-        cloudMsgTemp.header.frame_id = "camera_init";
+        cloudMsgTemp.header.frame_id = map_frame_id_;
         pubGlobalMap_.publish(cloudMsgTemp);  
         
     }
@@ -399,7 +472,7 @@ public:
             return false;
         }
 
-        if(fabs(SCclosestHistoryFrameID_ - latestFrameIDLoopCloure) < 10)
+        if(fabs(SCclosestHistoryFrameID_ - latestFrameIDLoopCloure) < 60)
         {
             std::cout << "this key is too close.not add loop " << latestFrameIDLoopCloure << ",history indx " << SCclosestHistoryFrameID_ << std::endl;
             return false;
@@ -418,6 +491,8 @@ public:
         // i.e., set the query point cloud within mapside's local coordinate
         Eigen::Matrix4d sc_last_pose = KeyFramePose2EigenPose(corrected_frame_pose_[SCclosestHistoryFrameID_]);
         pcl::transformPointCloud(*all_lidar_buffer_[loop_idx].pc_ptr, *SClatestSurfKeyFrameCloud_, sc_last_pose);
+        downSizeFilterKeyFrame_.setInputCloud(SClatestSurfKeyFrameCloud_);
+        downSizeFilterKeyFrame_.filter(*SClatestSurfKeyFrameCloud_);
 
 	    // save history near key frames: map ptcloud (icp to query ptcloud)
         Eigen::Matrix4d sc_his_pose;
@@ -449,6 +524,10 @@ public:
         int lidar_size_before_add = all_lidar_buffer_.size();
         all_lidar_buffer_.insert(all_lidar_buffer_.end(), tmp_lidar_buffer_.begin(), tmp_lidar_buffer_.end());
         
+        bool open_loop_switch = true;
+        std::ofstream evoRAWFile;
+        evoRAWFile.open("/home/hh/桌面/Fserial/street_08_notloop.txt", std::ios::app);
+
         //find loop closure
         while(!tmp_lidar_buffer_.empty())
         {
@@ -474,48 +553,26 @@ public:
 
                 gtsam::Pose3 poseTo   = gtsam::Pose3(gtsam::Rot3::RzRyRx(tmp_key_frame_odom_pose_[loop_idx].roll, tmp_key_frame_odom_pose_[loop_idx].pitch, tmp_key_frame_odom_pose_[loop_idx].yaw),
                                                     gtsam::Point3(tmp_key_frame_odom_pose_[loop_idx].pos_x, tmp_key_frame_odom_pose_[loop_idx].pos_y, tmp_key_frame_odom_pose_[loop_idx].pos_z));
-                std::cout << "pose to " << poseFrom.between(poseTo) << std::endl;
+                // std::cout << "pose to " << poseFrom.between(poseTo) << std::endl;
                 gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(loop_idx-1, loop_idx, poseFrom.between(poseTo), odometryNoise));
                 initialEstimate.insert(loop_idx, gtsam::Pose3(gtsam::Rot3::RzRyRx(tmp_key_frame_odom_pose_[loop_idx].roll, tmp_key_frame_odom_pose_[loop_idx].pitch, tmp_key_frame_odom_pose_[loop_idx].yaw),
                                                     gtsam::Point3(tmp_key_frame_odom_pose_[loop_idx].pos_x, tmp_key_frame_odom_pose_[loop_idx].pos_y, tmp_key_frame_odom_pose_[loop_idx].pos_z)));
             }
 
-            bool aLoopIsClosed = false;
-            //add loop factor
-            for (int i = 0; i < (int)loopIndexQueue.size(); ++i)
-            {
-                aLoopIsClosed = true;
-                int indexFrom = loopIndexQueue[i].first;
-                int indexTo = loopIndexQueue[i].second;
-                gtsam::Pose3 poseBetween = loopPoseQueue[i];
-                // gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i]; // original 
-                auto noiseBetween = loopNoiseQueue[i]; // giseop for polymorhpism // shared_ptr<gtsam::noiseModel::Base>, typedef noiseModel::Base::shared_ptr gtsam::SharedNoiseModel
-                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
-                std::cout << "add loop " << std::endl;
-            }
-
-            loopIndexQueue.clear();
-            loopPoseQueue.clear();
-            loopNoiseQueue.clear();
+            evoRAWFile << std::fixed;
+            evoRAWFile << tmp_data.pc_time << " " << tmp_key_frame_odom_pose_[loop_idx].pos_x << " " << tmp_key_frame_odom_pose_[loop_idx].pos_y << " " << tmp_key_frame_odom_pose_[loop_idx].pos_z << " "
+                    << tmp_key_frame_odom_pose_[loop_idx].ori_x << " " << tmp_key_frame_odom_pose_[loop_idx].ori_y << " " << tmp_key_frame_odom_pose_[loop_idx].ori_z << " " << tmp_key_frame_odom_pose_[loop_idx].ori_w << std::endl;
             
             isam->update(gtSAMgraph, initialEstimate);
             isam->update();
-            //update
-            if (aLoopIsClosed == true)
-            {
-                isam->update();
-                isam->update();
-                isam->update();
-                isam->update();
-                isam->update();
-            }
-
+        
             gtSAMgraph.resize(0);
             initialEstimate.clear();
             
             //save the lastest corrected pose
             gtsam::Pose3 latestEstimate;
             CloudPoseXYZOri tmp_pose_data;
+            tmp_pose_data.time = tmp_data.pc_time;
 
             isamCurrentEstimate = isam->calculateEstimate();
             latestEstimate = isamCurrentEstimate.at<gtsam::Pose3>(isamCurrentEstimate.size()-1);
@@ -544,41 +601,6 @@ public:
             correct_point.intensity = latestEstimate.translation().z();
             corrected_path_cloud_->points.push_back(correct_point);
 
-            //update all pose if loop
-            if (aLoopIsClosed == true)
-            {
-                isamCurrentEstimate = isam->calculateEstimate();
-                int numPoses = isamCurrentEstimate.size();
-                
-                for (int i = 0; i < numPoses; ++i){
-
-                    tmp_pose_data.pos_x = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().x();
-                    tmp_pose_data.pos_y = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().y();
-                    tmp_pose_data.pos_z = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().z();
-                    tmp_pose_data.roll  = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().roll();
-                    tmp_pose_data.pitch = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().pitch();
-                    tmp_pose_data.yaw   = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().yaw();
-
-                    corrected_path_cloud_->points[i].x = tmp_pose_data.pos_x;
-                    corrected_path_cloud_->points[i].y = tmp_pose_data.pos_y;
-                    corrected_path_cloud_->points[i].z = tmp_pose_data.pos_z;
-                    corrected_path_cloud_->points[i].intensity = tmp_pose_data.pos_z;
-
-                    Eigen::Quaterniond quaternion3;
-                    quaternion3 = Eigen::AngleAxisd(tmp_pose_data.yaw, Eigen::Vector3d::UnitZ()) * 
-                                    Eigen::AngleAxisd(tmp_pose_data.pitch, Eigen::Vector3d::UnitY()) * 
-                                    Eigen::AngleAxisd(tmp_pose_data.roll, Eigen::Vector3d::UnitX());
-                    tmp_pose_data.ori_x = quaternion3.x();
-                    tmp_pose_data.ori_y = quaternion3.y();
-                    tmp_pose_data.ori_z = quaternion3.z();
-                    tmp_pose_data.ori_w = quaternion3.w();
-                    
-                    corrected_frame_pose_[i] = tmp_pose_data;
-                }
-
-                publishGlobalMap();
-            }
-
             //add to sc manager
             scManager_.makeAndSaveScancontextAndKeys(*tmp_data.pc_ptr);
             
@@ -588,7 +610,7 @@ public:
 
             loop_frame_skip_cnt_ ++; // loop detect per 2 frame
 
-            if(loop_frame_skip_cnt_ % 2 == 0)
+            if(open_loop_switch == true && loop_frame_skip_cnt_ % 2 == 0 )
             {
                 loop_frame_skip_cnt_ = 0;
 
@@ -618,8 +640,10 @@ public:
                     // icp.align(*unused_result, icpInitialMat); // PCL icp non-eye initial is bad ... don't use (LeGO LOAM author also said pcl transform is weird.)
 
                     std::cout << "[SC] ICP fit score: " << icp.getFitnessScore() << std::endl;
-                    if ( icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore_ ) {
-                        std::cout << "[SC] Reject this loop (bad icp fit score, > " << historyKeyframeFitnessScore_ << ")" << std::endl;
+                    correctionCameraFrame = icp.getFinalTransformation();
+                    pcl::getTranslationAndEulerAngles (correctionCameraFrame, x, y, z, roll, pitch, yaw);
+                    if ( icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore_  || yaw > 0.3) {
+                        std::cout << "[SC] Reject this loop (bad icp fit score, > " << historyKeyframeFitnessScore_ << ") yaw " << yaw << std::endl;
                         isValidSCloopFactor = false;
                     }
                     else {
@@ -629,36 +653,20 @@ public:
 
                     if( isValidSCloopFactor == true ) {
 
-                        correctionCameraFrame = icp.getFinalTransformation(); // get transformation in camera frame (because points are in camera frame)
+                         // get transformation in camera frame (because points are in camera frame)
                         // icp.align(*unused_result, correctionCameraFrame.matrix()); 
                         // correctionCameraFrame = icp.getFinalTransformation();
-
-                        pcl::getTranslationAndEulerAngles (correctionCameraFrame, x, y, z, roll, pitch, yaw);
                         std::cout << "x " << x << ",y " << y << ",z " << z << ",roll " << roll << " pitch " << pitch << ",yaw " << yaw << std::endl;
                         gtsam::Pose3 poseFrom = gtsam::Pose3(gtsam::Rot3::RzRyRx(roll, pitch, yaw), gtsam::Point3(x, y, z));
                         gtsam::Pose3 poseTo = gtsam::Pose3(gtsam::Rot3::RzRyRx(0.0, 0.0, 0.0), gtsam::Point3(0.0, 0.0, 0.0));
                         
                         // std::lock_guard<std::mutex> lock(mtx);
-                        
-                        float noiseScore = icp.getFitnessScore();
-                        if(noiseScore < 0.06)
-                        {
-                            Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
-                            gtsam::noiseModel::Diagonal::shared_ptr constraintNoise = gtsam::noiseModel::Diagonal::Variances(Vector6);
-                            loopNoiseQueue.push_back(constraintNoise);
-                        }               
-                        else
-                        {
-                            noiseScore = 0.3;
-                            Vector6 << noiseScore, 1e-2, noiseScore, noiseScore, noiseScore, noiseScore;
-                            gtsam::noiseModel::Base::shared_ptr robust_noise = gtsam::noiseModel::Robust::Create(
-                                gtsam::noiseModel::mEstimator::Cauchy::Create(1.5), // optional: replacing Cauchy by DCS or GemanMcClure
-                                gtsam::noiseModel::Diagonal::Variances(Vector6)
-                            );
-                            loopNoiseQueue.push_back(robust_noise);
-                        }
-                        loopIndexQueue.push_back(make_pair(loop_idx, SCclosestHistoryFrameID_));
-                        loopPoseQueue.push_back(poseFrom.between(poseTo));
+                        float noiseScore = 0.3; //enough
+                        Vector6 << noiseScore, 1e-2, noiseScore, noiseScore, noiseScore, noiseScore;
+                        gtsam::noiseModel::Base::shared_ptr robust_noise = gtsam::noiseModel::Robust::Create(
+                            gtsam::noiseModel::mEstimator::Cauchy::Create(1.5), // optional: replacing Cauchy by DCS or GemanMcClure
+                            gtsam::noiseModel::Diagonal::Variances(Vector6)
+                        );
                         
                         LOOPIDX loop_idx_pair{loop_idx, SCclosestHistoryFrameID_};
                         loopIndexContainer.insert(std::pair<LOOPIDX, int>(loop_idx_pair, 1));
@@ -669,8 +677,49 @@ public:
                             sensor_msgs::PointCloud2 cloudMsgTemp;
                             pcl::toROSMsg(*unused_result, cloudMsgTemp);
                             cloudMsgTemp.header.stamp = ros::Time().fromSec(tmp_data.pc_time);
-                            cloudMsgTemp.header.frame_id = "camera_init";
+                            cloudMsgTemp.header.frame_id = map_frame_id_;
                             pubIcpKeyFrames_.publish(cloudMsgTemp);
+                        }
+
+                        gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(loop_idx, SCclosestHistoryFrameID_, poseFrom.between(poseTo), robust_noise));
+
+                        //update
+                        isam->update(gtSAMgraph);
+                        isam->update();
+                        isam->update();
+                        isam->update();
+                        isam->update();
+                        isam->update();
+                        gtSAMgraph.resize(0);
+
+                        //update all pose
+                        isamCurrentEstimate = isam->calculateEstimate();
+                        int numPoses = isamCurrentEstimate.size();
+                        
+                        for (int i = 0; i < numPoses; ++i){
+
+                            tmp_pose_data.pos_x = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().x();
+                            tmp_pose_data.pos_y = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().y();
+                            tmp_pose_data.pos_z = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().z();
+                            tmp_pose_data.roll  = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().roll();
+                            tmp_pose_data.pitch = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().pitch();
+                            tmp_pose_data.yaw   = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().yaw();
+
+                            corrected_path_cloud_->points[i].x = tmp_pose_data.pos_x;
+                            corrected_path_cloud_->points[i].y = tmp_pose_data.pos_y;
+                            corrected_path_cloud_->points[i].z = tmp_pose_data.pos_z;
+                            corrected_path_cloud_->points[i].intensity = tmp_pose_data.pos_z;
+
+                            Eigen::Quaterniond quaternion3;
+                            quaternion3 = Eigen::AngleAxisd(tmp_pose_data.yaw, Eigen::Vector3d::UnitZ()) * 
+                                            Eigen::AngleAxisd(tmp_pose_data.pitch, Eigen::Vector3d::UnitY()) * 
+                                            Eigen::AngleAxisd(tmp_pose_data.roll, Eigen::Vector3d::UnitX());
+                            tmp_pose_data.ori_x = quaternion3.x();
+                            tmp_pose_data.ori_y = quaternion3.y();
+                            tmp_pose_data.ori_z = quaternion3.z();
+                            tmp_pose_data.ori_w = quaternion3.w();
+                            tmp_pose_data.time = corrected_frame_pose_[i].time;
+                            corrected_frame_pose_[i] = tmp_pose_data;
                         }
                     }
                 }
@@ -680,7 +729,22 @@ public:
         // *loop_path_cloud_ = *path_cloud_;
         // data_lock_.unlock();
         //pub the correct map
+        WriteEvoPose();
         PubKeyFramePose(corrected_path_cloud_, ros::Time::now().toSec());
+    }
+
+    void WriteEvoPose()
+    {
+        std::ofstream evoFile;
+        evoFile.open("/home/hh/桌面/Fserial/street_08_loop.txt", std::ios::ate);
+
+        for(auto& p : corrected_frame_pose_)
+        {
+            evoFile << std::fixed;
+            evoFile << p.time << " " << p.pos_x << " " << p.pos_y << " " << p.pos_z << " "
+                    << p.ori_x << " " << p.ori_y << " " << p.ori_z << " " << p.ori_w << std::endl;
+        }
+        evoFile.close();
     }
 
 
@@ -700,11 +764,3 @@ int main(int argc, char** argv)
 
     return 0;
 }
-
-
-
-
-
-
-
-
