@@ -68,8 +68,8 @@ private:
     ros::Publisher pubIcpKeyFrames_;
     ros::Publisher pubGlobalMap_;
 
-    std::string front_laser_odom_topic_ = "/Odometry"; //Odometry ndt_lio_odom
-    std::string cloud_topic_ = "/cloud_registered_body"; //cloud_registered_body pandar
+    std::string front_laser_odom_topic_ = "/ndt_lio_odom"; //Odometry ndt_lio_odom
+    std::string cloud_topic_ = "/rslidar_points_undistor"; //cloud_registered_body pandar
     bool first_frame_ = true;
 
     std::deque<CloudPoseXYZOri> key_frame_odom_poses_, corrected_frame_pose_;
@@ -133,7 +133,7 @@ private:
 
     pcl::PointCloud<PointType>::Ptr globalMapKeyFramesDS_;
 
-    double historyKeyframeFitnessScore_ = 1.0; // 0.16
+    double historyKeyframeFitnessScore_ = 0.16; // 0.16
     int SCclosestHistoryFrameID_;
 
     unsigned short loop_frame_skip_cnt_ = 0;
@@ -146,7 +146,7 @@ private:
     gtsam::noiseModel::Diagonal::shared_ptr priorNoise;
     gtsam::noiseModel::Diagonal::shared_ptr odometryNoise;
 
-    std::string map_frame_id_ = "camera_init"; //camera_init
+    std::string map_frame_id_ = "map"; //camera_init
 
 public:
     LoopClosure(/* args */){
@@ -160,7 +160,7 @@ public:
 
         odom_sub_.subscribe(nh_, front_laser_odom_topic_, 1);
         key_frame_cloud_sub_.subscribe(nh_, cloud_topic_, 1);
-        sync_.reset(new Sync(MySyncPolicy(5), odom_sub_, key_frame_cloud_sub_));
+        sync_.reset(new Sync(MySyncPolicy(1000), odom_sub_, key_frame_cloud_sub_));
         sync_->registerCallback(boost::bind(&LoopClosure::SyncDataCallback, this, _1, _2));
 
         pubLoopConstraintEdge_ = nh_.advertise<visualization_msgs::MarkerArray>("/loop_closure_constraints", 1, true);
@@ -490,7 +490,8 @@ public:
         // NOTE: using "closestHistoryFrameID" to make same root of submap points to get a direct relative between the query point cloud (latestSurfKeyFrameCloud) and the map (nearHistorySurfKeyFrameCloud). by giseop
         // i.e., set the query point cloud within mapside's local coordinate
         Eigen::Matrix4d sc_last_pose = KeyFramePose2EigenPose(corrected_frame_pose_[SCclosestHistoryFrameID_]);
-        pcl::transformPointCloud(*all_lidar_buffer_[loop_idx].pc_ptr, *SClatestSurfKeyFrameCloud_, sc_last_pose);
+        // pcl::transformPointCloud(*all_lidar_buffer_[loop_idx].pc_ptr, *SClatestSurfKeyFrameCloud_, sc_last_pose);
+        *SClatestSurfKeyFrameCloud_ = *all_lidar_buffer_[loop_idx].pc_ptr;
         downSizeFilterKeyFrame_.setInputCloud(SClatestSurfKeyFrameCloud_);
         downSizeFilterKeyFrame_.filter(*SClatestSurfKeyFrameCloud_);
 
@@ -636,11 +637,15 @@ public:
                     icp.setInputSource(SClatestSurfKeyFrameCloud_);
                     icp.setInputTarget(SCnearHistorySurfKeyFrameCloudDS_);
                     pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
-                    icp.align(*unused_result); 
+                    Eigen::Matrix4d sc_last_pose = KeyFramePose2EigenPose(corrected_frame_pose_[SCclosestHistoryFrameID_]);// init guess
+                    Eigen::Matrix4d sc_his_pose = KeyFramePose2EigenPose(corrected_frame_pose_[SCclosestHistoryFrameID_]);
+                    icp.align(*unused_result, sc_last_pose.cast<float>()); 
                     // icp.align(*unused_result, icpInitialMat); // PCL icp non-eye initial is bad ... don't use (LeGO LOAM author also said pcl transform is weird.)
 
                     std::cout << "[SC] ICP fit score: " << icp.getFitnessScore() << std::endl;
                     correctionCameraFrame = icp.getFinalTransformation();
+                    Eigen::Matrix4d delta_pose = sc_his_pose.inverse() * correctionCameraFrame.matrix().cast<double>();
+                    correctionCameraFrame = delta_pose.cast<float>();
                     pcl::getTranslationAndEulerAngles (correctionCameraFrame, x, y, z, roll, pitch, yaw);
                     if ( icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore_  || yaw > 0.3) {
                         std::cout << "[SC] Reject this loop (bad icp fit score, > " << historyKeyframeFitnessScore_ << ") yaw " << yaw << std::endl;
@@ -659,7 +664,10 @@ public:
                         std::cout << "x " << x << ",y " << y << ",z " << z << ",roll " << roll << " pitch " << pitch << ",yaw " << yaw << std::endl;
                         gtsam::Pose3 poseFrom = gtsam::Pose3(gtsam::Rot3::RzRyRx(roll, pitch, yaw), gtsam::Point3(x, y, z));
                         gtsam::Pose3 poseTo = gtsam::Pose3(gtsam::Rot3::RzRyRx(0.0, 0.0, 0.0), gtsam::Point3(0.0, 0.0, 0.0));
+                        // gtsam::Pose3 poseTo = gtsam::Pose3(gtsam::Rot3::RzRyRx(corrected_frame_pose_[SCclosestHistoryFrameID_].roll, corrected_frame_pose_[SCclosestHistoryFrameID_].pitch, corrected_frame_pose_[SCclosestHistoryFrameID_].yaw),
+                        //                                  gtsam::Point3(corrected_frame_pose_[SCclosestHistoryFrameID_].pos_x, corrected_frame_pose_[SCclosestHistoryFrameID_].pos_y, corrected_frame_pose_[SCclosestHistoryFrameID_].pos_z));
                         
+                        std::cout << correctionCameraFrame.matrix() << std::endl;
                         // std::lock_guard<std::mutex> lock(mtx);
                         float noiseScore = 0.3; //enough
                         Vector6 << noiseScore, 1e-2, noiseScore, noiseScore, noiseScore, noiseScore;
